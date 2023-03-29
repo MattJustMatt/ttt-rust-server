@@ -8,7 +8,11 @@ use axum::{
     Router, Server,
 };
 use num_format::{Locale, WriteFormatted};
-use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
+use rand::{
+    rngs::StdRng,
+    seq::{IteratorRandom, SliceRandom},
+    Rng, SeedableRng,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,19 +23,20 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 struct AppState {
     tx: broadcast::Sender<Event>,
+    conn_count: Arc<AtomicUsize>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 enum Event {
     CreateGame {
-        game_id: usize,
+        id: usize,
     },
     UpdateGame {
-        game_id: usize,
-        board: [usize; 9],
+        id: usize,
+        positions: [usize; 9],
     },
     GameEnd {
-        game_id: usize,
+        id: usize,
         winner: usize,
         winning_line: [usize; 3],
     },
@@ -43,41 +48,73 @@ struct MessageOutput {
     event_data: Event,
 }
 
+struct Board {
+    id: usize,
+    positions: [usize; 9],
+    winner: Option<usize>,
+}
+
 #[tokio::main]
 async fn main() {
-    let (tx, _) = broadcast::channel::<Event>(100);
+    let (tx, _) = broadcast::channel::<Event>(8);
 
     tracing_subscriber::fmt::init();
 
-    let app_state = AppState { tx: tx.clone() };
+    let app_state = AppState {
+        tx: tx.clone(),
+        conn_count: Arc::new(AtomicUsize::new(0)),
+    };
 
     let router = Router::new()
         .route("/realtime/ttt", get(realtime_ttt_get))
         .with_state(app_state.clone());
 
     let tps_count = Arc::new(AtomicUsize::new(0));
-    log_tps(Arc::clone(&tps_count));
+    log_stats(Arc::clone(&tps_count), Arc::clone(&app_state.conn_count));
 
     tokio::task::spawn(async move {
         let mut rng = StdRng::from_entropy();
-        let mut game_id = 0;
 
-        let mut interval = tokio::time::interval(std::time::Duration::from_micros(5_000)); // Run at 200 Hz
+        let mut tick_interval = tokio::time::interval(std::time::Duration::from_micros(3_000));
+
+        const MAX_CONCURRENT_GAMES: usize = 10;
+        const MAX_STORED_GAMES: usize = 10_000;
+        let mut boards: Vec<Board> = vec![];
         loop {
+            // If we run out of space just nuke the games... it's fast I think
+            if boards.len() > MAX_STORED_GAMES {
+                println!(
+                    "CLEARED GAMES -- max stored games ({}) was reached",
+                    MAX_STORED_GAMES
+                );
+                boards = vec![];
+            }
+
             // Create a new game and send a create game event
-            game_id += 1;
-
-            // Broadcast that we've created a new game
-            let create_event = Event::CreateGame { game_id };
-            let _ = tx.send(create_event);
-
-            let mut board: [usize; 9] = [0; 9];
-            for _ in 0..9 {
-                if false {
-                    interval.tick().await;
+            if boards.iter().filter(|board| board.winner.is_none()).count() < MAX_CONCURRENT_GAMES {
+                let id = boards.len();
+                match tx.send(Event::CreateGame { id }) {
+                    Ok(_) => (),
+                    Err(_) => (),
                 }
 
-                let available_cells: Vec<usize> = board
+                let board = Board {
+                    id,
+                    positions: [0; 9],
+                    winner: None,
+                };
+                boards.push(board);
+            }
+
+            // Choose a random unfinished game
+            if let Some((id, ticking_game)) = boards
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, board)| board.winner.is_none())
+                .choose(&mut rng)
+            {
+                let available_cells: Vec<usize> = ticking_game
+                    .positions
                     .iter()
                     .enumerate()
                     .filter(|(_, &cell)| cell == 0)
@@ -85,47 +122,48 @@ async fn main() {
                     .collect();
 
                 if let Some(&move_index) = available_cells.choose(&mut rng) {
-                    board[move_index] = rng.gen_range(1..3);
+                    ticking_game.positions[move_index] = rng.gen_range(1..3);
 
-                    let update_event = Event::UpdateGame { game_id, board };
                     tps_count.fetch_add(1, Ordering::Relaxed);
-                    let _ = tx.send(update_event);
-
-                    // Check for a win condition or a draw
-                    if let Some(winning_line) = get_winning_line(&board) {
-                        let winner = board[winning_line[0]];
-
-                        // Send the game end event
-                        let end_event = Event::GameEnd {
-                            game_id,
-                            winner,
-                            winning_line,
-                        };
-                        let _ = tx.send(end_event);
-                        break;
-                    } else if board.iter().all(|&cell| cell != 0) {
-                        // Send the game end event for a draw
-                        let end_event = Event::GameEnd {
-                            game_id,
-                            winner: 0,
-                            winning_line: [0, 0, 0],
-                        };
-                        let _ = tx.send(end_event);
-                        break;
+                    match tx.send(Event::UpdateGame {
+                        id: ticking_game.id,
+                        positions: ticking_game.positions,
+                    }) {
+                        Ok(_) => (),
+                        Err(_) => (),
                     }
 
-                    // Yield to give other tasks a chance to run
+                    // Check for a win condition or a draw
+                    if let Some(winning_line) = get_winning_line(&ticking_game.positions) {
+                        let winner = ticking_game.positions[winning_line[0]];
+                        ticking_game.winner = Some(winner);
+
+                        match tx.send(Event::GameEnd {
+                            id,
+                            winner,
+                            winning_line,
+                        }) {
+                            Ok(_) => (),
+                            Err(_) => (),
+                        }
+                    } else if ticking_game.positions.iter().all(|&cell| cell != 0) {
+                        // Draw case
+                        ticking_game.winner = Some(0);
+                        match tx.send(Event::GameEnd {
+                            id,
+                            winner: 0,
+                            winning_line: [0, 0, 0],
+                        }) {
+                            Ok(_) => (),
+                            Err(_) => (),
+                        }
+                    }
+
+                    // true = normal mode. false = fast boi mode
+                    if true {
+                        tick_interval.tick().await;
+                    }
                     tokio::task::yield_now().await;
-                } else {
-                    // In the rare case when there are no available cells but no winner, consider it a draw
-                    let end_event = Event::GameEnd {
-                        game_id,
-                        winner: 0,
-                        winning_line: [0, 0, 0],
-                    };
-                    tps_count.fetch_add(1, Ordering::Relaxed);
-                    let _ = tx.send(end_event);
-                    break;
                 }
             }
         }
@@ -133,7 +171,7 @@ async fn main() {
 
     let server = Server::bind(&"0.0.0.0:7032".parse().unwrap()).serve(router.into_make_service());
     let addr = server.local_addr();
-    println!("Listening on {addr}");
+    println!("[TTT REALTIME] Listening on {addr}");
 
     server.await.unwrap();
 }
@@ -149,21 +187,22 @@ async fn realtime_ttt_get(
 async fn realtime_ttt_stream(app_state: AppState, ws: WebSocket) {
     let mut rx = app_state.tx.subscribe();
     let ws = Arc::new(Mutex::new(ws));
+    app_state.conn_count.fetch_add(1, Ordering::Relaxed);
 
     while let Ok(event) = rx.recv().await {
         let message_output = match &event {
-            Event::CreateGame { game_id } => {
-                json!(["c", { "i": game_id }])
+            Event::CreateGame { id } => {
+                json!(["c", { "i": id }])
             }
-            Event::UpdateGame { game_id, board } => {
-                json!(["u", { "i": game_id, "p": board }])
+            Event::UpdateGame { id, positions } => {
+                json!(["u", { "i": id, "p": positions }])
             }
             Event::GameEnd {
-                game_id,
+                id,
                 winner,
                 winning_line,
             } => {
-                json!(["e", { "i": game_id, "w": winner, "wl": winning_line }])
+                json!(["e", { "i": id, "w": winner, "wl": winning_line }])
             }
         };
 
@@ -171,11 +210,13 @@ async fn realtime_ttt_stream(app_state: AppState, ws: WebSocket) {
 
         let mut ws_lock = ws.lock().await;
         if let Err(e) = ws_lock.send(message_text).await {
-            eprint!("Error sending {:?}", e);
+            eprint!("NET ERROR: {:?}", e);
             // Disconnect (break from the loop) if we encounter an error (typically a client leaving)
             break;
         }
     }
+
+    app_state.conn_count.fetch_min(1, Ordering::Relaxed);
 }
 
 fn get_winning_line(board: &[usize; 9]) -> Option<[usize; 3]> {
@@ -202,7 +243,7 @@ fn get_winning_line(board: &[usize; 9]) -> Option<[usize; 3]> {
     })
 }
 
-fn log_tps(tps_count: Arc<AtomicUsize>) {
+fn log_stats(tps_count: Arc<AtomicUsize>, conn_count: Arc<AtomicUsize>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -212,7 +253,11 @@ fn log_tps(tps_count: Arc<AtomicUsize>) {
             formatted_create_count
                 .write_formatted(&count, &Locale::en)
                 .unwrap();
-            println!("Processed {} TPS", formatted_create_count);
+            println!(
+                "Processed {} TPS for {:?} connected client(s)",
+                formatted_create_count,
+                conn_count.clone()
+            );
         }
     });
 }
