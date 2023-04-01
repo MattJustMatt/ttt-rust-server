@@ -44,6 +44,9 @@ enum Event {
         winner: usize,
         winning_line: [usize; 3],
     },
+    Stats {
+        connections: usize,
+    },
 }
 
 #[derive(Serialize)]
@@ -71,29 +74,38 @@ async fn main() {
 
     let tps_count = Arc::new(AtomicUsize::new(0));
     log_stats(Arc::clone(&tps_count), Arc::clone(&app_state.conn_count));
+    let conn_count_clone = Arc::clone(&app_state.conn_count);
 
     tokio::task::spawn(async move {
         let mut rng = StdRng::from_entropy();
 
-        let mut tick_interval = tokio::time::interval(std::time::Duration::from_micros(3_000));
+        let mut tick_interval = tokio::time::interval(std::time::Duration::from_micros(500));
 
         const MAX_CONCURRENT_GAMES: usize = 10;
         const MAX_STORED_GAMES: usize = 10_000;
         let mut boards: Vec<Board> = vec![];
+        let mut total_boards_created: usize = 0;
         loop {
-            // If we run out of space just nuke the games... it's fast I think
             if boards.len() > MAX_STORED_GAMES {
-                // TODO: Sent game end events for outstanding games or just filter out dead ones
                 println!(
-                    "CLEARED GAMES -- max stored games ({}) was reached",
+                    "FILTERED GAMES -- max stored games ({}) was reached",
                     MAX_STORED_GAMES
                 );
-                boards = vec![];
+                boards.retain(|board| board.winner.is_none());
             }
 
             // Create a new game and send a create game event
             if boards.iter().filter(|board| board.winner.is_none()).count() < MAX_CONCURRENT_GAMES {
-                let id = boards.len();
+                let id = total_boards_created;
+                total_boards_created += 1;
+
+                if id % 100 == 0 {
+                    match tx.send(Event::Stats { connections: conn_count_clone.load(Ordering::Relaxed) }) {
+                        Ok(_) => (),
+                        Err(_) => (),
+                    }
+                }
+
                 match tx.send(Event::CreateGame { id }) {
                     Ok(_) => (),
                     Err(_) => (),
@@ -108,7 +120,7 @@ async fn main() {
             }
 
             // Choose a random unfinished game
-            if let Some((id, ticking_game)) = boards
+            if let Some((_, ticking_game)) = boards
                 .iter_mut()
                 .enumerate()
                 .filter(|(_, board)| board.winner.is_none())
@@ -140,7 +152,7 @@ async fn main() {
                         ticking_game.winner = Some(winner);
 
                         match tx.send(Event::GameEnd {
-                            id,
+                            id: ticking_game.id,
                             winner,
                             winning_line,
                         }) {
@@ -151,7 +163,7 @@ async fn main() {
                         // Draw case
                         ticking_game.winner = Some(0);
                         match tx.send(Event::GameEnd {
-                            id,
+                            id: ticking_game.id,
                             winner: 0,
                             winning_line: [0, 0, 0],
                         }) {
@@ -218,12 +230,15 @@ async fn realtime_ttt_stream(app_state: AppState, mut ws: WebSocket) {
             } => {
                 json!(["e", { "i": id, "w": winner, "wl": winning_line }])
             }
+            Event::Stats { connections } => {
+                json!(["s", { "conn": connections }])
+            }
         };
 
         let message_text = Message::Text(serde_json::to_string(&message_output).unwrap());
 
         if let Err(e) = ws.send(message_text).await {
-            eprint!("NET ERROR: {:?}", e);
+            eprintln!("NET ERROR: {:?}", e);
             break; // Disconnect if we encounter an error (typically a client leaving)
         }
     }
