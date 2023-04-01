@@ -79,7 +79,7 @@ async fn main() {
     tokio::task::spawn(async move {
         let mut rng = StdRng::from_entropy();
 
-        let mut tick_interval = tokio::time::interval(std::time::Duration::from_micros(5_000));
+        let mut tick_interval = tokio::time::interval(std::time::Duration::from_micros(3_000));
 
         const MAX_CONCURRENT_GAMES: usize = 10;
         const MAX_STORED_GAMES: usize = 100_000;
