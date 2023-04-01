@@ -5,8 +5,9 @@ use axum::{
     },
     response::IntoResponse,
     routing::get,
-    Router, Server,
+    Router,
 };
+use axum_server::AddrIncomingConfig;
 use num_format::{Locale, WriteFormatted};
 use rand::{
     rngs::StdRng,
@@ -15,10 +16,13 @@ use rand::{
 };
 use serde::Serialize;
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::{
+    net::SocketAddr,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 use tokio::sync::broadcast;
-use tokio::sync::Mutex;
 
 #[derive(Clone)]
 struct AppState {
@@ -65,10 +69,6 @@ async fn main() {
         conn_count: Arc::new(AtomicUsize::new(0)),
     };
 
-    let router = Router::new()
-        .route("/realtime/ttt", get(realtime_ttt_get))
-        .with_state(app_state.clone());
-
     let tps_count = Arc::new(AtomicUsize::new(0));
     log_stats(Arc::clone(&tps_count), Arc::clone(&app_state.conn_count));
 
@@ -83,6 +83,7 @@ async fn main() {
         loop {
             // If we run out of space just nuke the games... it's fast I think
             if boards.len() > MAX_STORED_GAMES {
+                // TODO: Sent game end events for outstanding games or just filter out dead ones
                 println!(
                     "CLEARED GAMES -- max stored games ({}) was reached",
                     MAX_STORED_GAMES
@@ -169,11 +170,25 @@ async fn main() {
         }
     });
 
-    let server = Server::bind(&"0.0.0.0:7032".parse().unwrap()).serve(router.into_make_service());
-    let addr = server.local_addr();
-    println!("[TTT REALTIME] Listening on {addr}");
+    let router = Router::new()
+        .route("/realtime/ttt", get(realtime_ttt_get))
+        .with_state(app_state.clone());
 
-    server.await.unwrap();
+    let config = AddrIncomingConfig::new()
+        .tcp_nodelay(true)
+        .tcp_sleep_on_accept_errors(true)
+        .tcp_keepalive(Some(Duration::from_secs(32)))
+        .tcp_keepalive_interval(Some(Duration::from_secs(1)))
+        .tcp_keepalive_retries(Some(1))
+        .build();
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 7032));
+    println!("[TTT REALTIME] Listening on {}", addr);
+    axum_server::bind(addr)
+        .addr_incoming_config(config)
+        .serve(router.into_make_service())
+        .await
+        .unwrap();
 }
 
 #[axum::debug_handler]
@@ -184,9 +199,8 @@ async fn realtime_ttt_get(
     ws.on_upgrade(|ws: WebSocket| async { realtime_ttt_stream(state, ws).await })
 }
 
-async fn realtime_ttt_stream(app_state: AppState, ws: WebSocket) {
+async fn realtime_ttt_stream(app_state: AppState, mut ws: WebSocket) {
     let mut rx = app_state.tx.subscribe();
-    let ws = Arc::new(Mutex::new(ws));
     app_state.conn_count.fetch_add(1, Ordering::Relaxed);
 
     while let Ok(event) = rx.recv().await {
@@ -208,11 +222,9 @@ async fn realtime_ttt_stream(app_state: AppState, ws: WebSocket) {
 
         let message_text = Message::Text(serde_json::to_string(&message_output).unwrap());
 
-        let mut ws_lock = ws.lock().await;
-        if let Err(e) = ws_lock.send(message_text).await {
+        if let Err(e) = ws.send(message_text).await {
             eprint!("NET ERROR: {:?}", e);
-            // Disconnect (break from the loop) if we encounter an error (typically a client leaving)
-            break;
+            break; // Disconnect if we encounter an error (typically a client leaving)
         }
     }
 
