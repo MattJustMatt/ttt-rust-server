@@ -37,12 +37,12 @@ enum Event {
     },
     UpdateGame {
         id: usize,
-        positions: [usize; 9],
+        new_position: [usize; 2],
     },
     GameEnd {
         id: usize,
         winner: usize,
-        winning_line: [usize; 3],
+        winning_line: [usize; 9],
     },
     Stats {
         connections: usize,
@@ -57,7 +57,7 @@ struct MessageOutput {
 
 struct Board {
     id: usize,
-    positions: [usize; 9],
+    positions: [usize; 3600],
     winner: Option<usize>,
 }
 
@@ -72,6 +72,8 @@ async fn main() {
         conn_count: Arc::new(AtomicUsize::new(0)),
     };
 
+    let win_conditions = generate_win_conditions();
+
     let tps_count = Arc::new(AtomicUsize::new(0));
     log_stats(Arc::clone(&tps_count), Arc::clone(&app_state.conn_count));
     let conn_count_clone = Arc::clone(&app_state.conn_count);
@@ -79,10 +81,10 @@ async fn main() {
     tokio::task::spawn(async move {
         let mut rng = StdRng::from_entropy();
 
-        let mut tick_interval = tokio::time::interval(std::time::Duration::from_micros(3_000));
+        let mut tick_interval = tokio::time::interval(std::time::Duration::from_micros(5_000));
 
-        const MAX_CONCURRENT_GAMES: usize = 10;
-        const MAX_STORED_GAMES: usize = 100_000;
+        const MAX_CONCURRENT_GAMES: usize = 2;
+        const MAX_STORED_GAMES: usize = 10_000;
         let mut boards: Vec<Board> = vec![];
         let mut total_boards_created: usize = 0;
         loop {
@@ -99,7 +101,8 @@ async fn main() {
                 let id = total_boards_created;
                 total_boards_created += 1;
 
-                if id % 100 == 0 {
+                // Every 10 boards send a stats update
+                if id % 10 == 0 {
                     match tx.send(Event::Stats { connections: conn_count_clone.load(Ordering::Relaxed) }) {
                         Ok(_) => (),
                         Err(_) => (),
@@ -113,7 +116,7 @@ async fn main() {
 
                 let board = Board {
                     id,
-                    positions: [0; 9],
+                    positions: [0; 3600],
                     winner: None,
                 };
                 boards.push(board);
@@ -140,14 +143,14 @@ async fn main() {
                     tps_count.fetch_add(1, Ordering::Relaxed);
                     match tx.send(Event::UpdateGame {
                         id: ticking_game.id,
-                        positions: ticking_game.positions,
+                        new_position: [move_index, ticking_game.positions[move_index]],
                     }) {
                         Ok(_) => (),
                         Err(_) => (),
                     }
 
                     // Check for a win condition or a draw
-                    if let Some(winning_line) = get_winning_line(&ticking_game.positions) {
+                    if let Some(winning_line) = get_winning_line(&ticking_game.positions, &win_conditions) {
                         let winner = ticking_game.positions[winning_line[0]];
                         ticking_game.winner = Some(winner);
 
@@ -165,7 +168,7 @@ async fn main() {
                         match tx.send(Event::GameEnd {
                             id: ticking_game.id,
                             winner: 0,
-                            winning_line: [0, 0, 0],
+                            winning_line: [0, 0, 0, 0, 0, 0, 0, 0, 0],
                         }) {
                             Ok(_) => (),
                             Err(_) => (),
@@ -173,7 +176,7 @@ async fn main() {
                     }
 
                     // true = normal mode. false = fast boi mode
-                    if true {
+                    if false {
                         tick_interval.tick().await;
                     }
                     tokio::task::yield_now().await;
@@ -220,8 +223,8 @@ async fn realtime_ttt_stream(app_state: AppState, mut ws: WebSocket) {
             Event::CreateGame { id } => {
                 json!(["c", { "i": id }])
             }
-            Event::UpdateGame { id, positions } => {
-                json!(["u", { "i": id, "p": positions }])
+            Event::UpdateGame { id, new_position } => {
+                json!(["u", { "i": id, "p": [new_position[0], new_position[1]] }])
             }
             Event::GameEnd {
                 id,
@@ -246,29 +249,78 @@ async fn realtime_ttt_stream(app_state: AppState, mut ws: WebSocket) {
     app_state.conn_count.fetch_min(1, Ordering::Relaxed);
 }
 
-fn get_winning_line(board: &[usize; 9]) -> Option<[usize; 3]> {
-    let win_conditions = [
-        [0, 1, 2],
-        [3, 4, 5],
-        [6, 7, 8],
-        [0, 3, 6],
-        [1, 4, 7],
-        [2, 5, 8],
-        [0, 4, 8],
-        [2, 4, 6],
-    ];
 
-    win_conditions.iter().find_map(|&line| {
-        if board[line[0]] != 0
-            && board[line[0]] == board[line[1]]
-            && board[line[0]] == board[line[2]]
-        {
-            Some(line)
-        } else {
-            None
+fn get_winning_line(board: &[usize; 3600], win_conditions: &Vec<Vec<usize>>) -> Option<[usize; 9]> {
+    
+
+    win_conditions.iter().find_map(|line| {
+        let mut consecutive = 1;
+        for i in 1..line.len() {
+            if board[line[i]] != 0 && board[line[i]] == board[line[i - 1]] {
+                consecutive += 1;
+            } else {
+                consecutive = 1;
+            }
+
+            if consecutive == 9 {
+                let mut winning_line = [0; 9];
+                winning_line.copy_from_slice(&line[i - 8..=i]);
+                return Some(winning_line);
+            }
         }
+        None
     })
 }
+
+
+fn generate_win_conditions() -> Vec<Vec<usize>> {
+    let mut win_conditions = Vec::new();
+    let size = 60;
+
+    for row in 0..size {
+        for col in 0..size {
+            let mut hor_line = Vec::new();
+            let mut ver_line = Vec::new();
+            let mut diag_line1 = Vec::new();
+            let mut diag_line2 = Vec::new();
+
+            for i in 0..9 {
+                if col + 8 < size {
+                    hor_line.push(row * size + col + i);
+                }
+
+                if row + 8 < size {
+                    ver_line.push((row + i) * size + col);
+                }
+
+                if col + 8 < size && row + 8 < size {
+                    diag_line1.push((row + i) * size + col + i);
+                }
+
+                if col >= 8 && row + 8 < size {
+                    diag_line2.push((row + i) * size + col - i);
+                }
+            }
+
+            if !hor_line.is_empty() {
+                win_conditions.push(hor_line);
+            }
+            if !ver_line.is_empty() {
+                win_conditions.push(ver_line);
+            }
+            if !diag_line1.is_empty() {
+                win_conditions.push(diag_line1);
+            }
+            if !diag_line2.is_empty() {
+                win_conditions.push(diag_line2);
+            }
+        }
+    }
+
+    win_conditions
+}
+
+
 
 fn log_stats(tps_count: Arc<AtomicUsize>, conn_count: Arc<AtomicUsize>) {
     tokio::spawn(async move {
