@@ -13,3 +13,4 @@ tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
 futures = "0.3"
 num-format = "0.4.4"
 axum-server = "*"
+rmp-serde = "0.15.4"

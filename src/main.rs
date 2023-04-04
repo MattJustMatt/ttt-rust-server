@@ -14,8 +14,8 @@ use rand::{
     seq::{IteratorRandom, SliceRandom},
     Rng, SeedableRng,
 };
+use rmp_serde::to_vec;
 use serde::Serialize;
-use serde_json::json;
 use std::sync::Arc;
 use std::{
     net::SocketAddr,
@@ -32,12 +32,13 @@ struct AppState {
 
 #[derive(Debug, Serialize, Clone)]
 enum Event {
-    CreateGame {
+    GameCreate {
         id: usize,
     },
-    UpdateGame {
+    GameUpdate {
         id: usize,
-        positions: [usize; 9],
+        square_to_update: usize,
+        new_value: usize,
     },
     GameEnd {
         id: usize,
@@ -106,7 +107,7 @@ async fn main() {
                     }
                 }
 
-                match tx.send(Event::CreateGame { id }) {
+                match tx.send(Event::GameCreate { id }) {
                     Ok(_) => (),
                     Err(_) => (),
                 }
@@ -138,9 +139,10 @@ async fn main() {
                     ticking_game.positions[move_index] = rng.gen_range(1..3);
 
                     tps_count.fetch_add(1, Ordering::Relaxed);
-                    match tx.send(Event::UpdateGame {
+                    match tx.send(Event::GameUpdate {
                         id: ticking_game.id,
-                        positions: ticking_game.positions,
+                        square_to_update: move_index,
+                        new_value: ticking_game.positions[move_index],
                     }) {
                         Ok(_) => (),
                         Err(_) => (),
@@ -216,34 +218,30 @@ async fn realtime_ttt_stream(app_state: AppState, mut ws: WebSocket) {
     app_state.conn_count.fetch_add(1, Ordering::Relaxed);
 
     while let Ok(event) = rx.recv().await {
-        let message_output = match &event {
-            Event::CreateGame { id } => {
-                json!(["c", { "i": id }])
-            }
-            Event::UpdateGame { id, positions } => {
-                json!(["u", { "i": id, "p": positions }])
-            }
-            Event::GameEnd {
-                id,
-                winner,
-                winning_line,
-            } => {
-                json!(["e", { "i": id, "w": winner, "wl": winning_line }])
-            }
+        let encoded_data = match &event {
+            Event::GameCreate { id } => {
+                to_vec(&id).unwrap()
+            },
+            Event::GameUpdate { id, square_to_update, new_value } => {
+                to_vec(&(id, square_to_update, new_value)).unwrap()
+            },
+            Event::GameEnd { id, winner, winning_line } => {
+                to_vec(&(id, winner, winning_line)).unwrap()
+            },
             Event::Stats { connections } => {
-                json!(["s", { "conn": connections }])
-            }
+                to_vec(&connections).unwrap()
+            },
         };
-
-        let message_text = Message::Text(serde_json::to_string(&message_output).unwrap());
-
-        if let Err(e) = ws.send(message_text).await {
+    
+        let message_binary = Message::Binary(encoded_data.into());
+    
+        if let Err(e) = ws.send(message_binary).await {
             eprintln!("NET ERROR: {:?}", e);
             break; // Disconnect if we encounter an error (typically a client leaving)
         }
     }
-
-    app_state.conn_count.fetch_min(1, Ordering::Relaxed);
+    
+    app_state.conn_count.fetch_sub(1, Ordering::Relaxed);
 }
 
 fn get_winning_line(board: &[usize; 9]) -> Option<[usize; 3]> {
