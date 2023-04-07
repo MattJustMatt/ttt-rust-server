@@ -60,6 +60,7 @@ struct Board {
     id: usize,
     positions: [usize; 9],
     winner: Option<usize>,
+    next_player: usize,
 }
 
 #[tokio::main]
@@ -100,7 +101,7 @@ async fn main() {
                 let id = total_boards_created;
                 total_boards_created += 1;
 
-                if id % 100 == 0 {
+                if id % 10 == 0 {
                     match tx.send(Event::Stats { connections: conn_count_clone.load(Ordering::Relaxed) }) {
                         Ok(_) => (),
                         Err(_) => (),
@@ -116,6 +117,7 @@ async fn main() {
                     id,
                     positions: [0; 9],
                     winner: None,
+                    next_player: rng.gen_range(1..3),
                 };
                 boards.push(board);
             }
@@ -135,14 +137,15 @@ async fn main() {
                     .map(|(i, _)| i)
                     .collect();
 
-                if let Some(&move_index) = available_cells.choose(&mut rng) {
-                    ticking_game.positions[move_index] = rng.gen_range(1..3);
+                if let Some(&position_index) = available_cells.choose(&mut rng) {
+                    ticking_game.positions[position_index] = ticking_game.next_player;
+                    ticking_game.next_player = 3 - ticking_game.next_player;
 
                     tps_count.fetch_add(1, Ordering::Relaxed);
                     match tx.send(Event::GameUpdate {
                         id: ticking_game.id,
-                        square_to_update: move_index,
-                        new_value: ticking_game.positions[move_index],
+                        square_to_update: position_index,
+                        new_value: ticking_game.positions[position_index],
                     }) {
                         Ok(_) => (),
                         Err(_) => (),
@@ -229,7 +232,7 @@ async fn realtime_ttt_stream(app_state: AppState, mut ws: WebSocket) {
                 to_vec(&(id, winner, winning_line)).unwrap()
             },
             Event::Stats { connections } => {
-                to_vec(&connections).unwrap()
+                to_vec(&(&-1, &connections)).unwrap()
             },
         };
     
